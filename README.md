@@ -11,7 +11,7 @@ I would be very grateful if you could help me update the pattern in the future.
 
 # Tutorial
 WIP
-
+![alt text](figures/position.png)
 # Credits
 This patcher is mainly for learning purposes and honing skills, which is based on:
 - [Enabling Achievements in Stellaris With Mods (All game versions) [SRE]](https://steamcommunity.com/sharedfiles/filedetails/?id=2460079052)
