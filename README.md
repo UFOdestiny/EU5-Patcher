@@ -1,13 +1,14 @@
 # EU5 Patcher to Enable Achievements Unconditionally
 The debate over whether Ironman mode should be required to unlock achievements has been going on for a long time. 
 Crusader Kings III and Stellaris set a good example, but Europa Universalis V took a step backward. 
-So I decided to make this patch, which enables the achievement system even in **non-ironman mode**, **with mods**, and under **any game settings**.  
-I would be very grateful if you could help me update the pattern in the future.
+So I decided to make this patch, which enables the achievement system even in **non-ironman mode**, **with mods**, and under **any game settings**. I would be very grateful if you could help me update the pattern in the future.  
+There are some bugs that may prevent achievements unlock in non-ironman mode and I'm working on that. If you use ironman mode, it is totally fine.
+
 ![alt text](figures/effect.png)
 # How to use it?
 0. Install Python and ensure the path is configured correctly.
-1. Put this `patcher.py` in the `.../Europa Universalis IV/binaries/`, where `eu5.exe` exists.
-2. Open `cmd` in this folder, and use the command `python patcher.py`.
+1. Put this `patch.py` in the `.../Europa Universalis IV/binaries/`, where `eu5.exe` exists.
+2. Open `cmd` in this folder, and use the command `python patch.py`.
    
 You'll see the message “EU5 is successfully patched” if the process completes successfully. After that, you can start a new game with any mods or settings in non-ironman mode. You might notice that the trophy icon appears red in the settings menu at first — just start the game, and it will turn green as shown in the figure.
 
