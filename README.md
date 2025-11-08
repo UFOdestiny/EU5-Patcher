@@ -1,7 +1,7 @@
 # EU5 Patcher to Enable Achievements Unconditionally
 The debate over whether Ironman mode should be required to unlock achievements has been going on for a long time. 
 Crusader Kings III and Stellaris set a good example, but Europa Universalis V took a step backward. 
-So I decided to make this patch, which enables the achievement system even in **non-Ironman mode**, **with mods**, and under **any game settings**.  
+So I decided to make this patch, which enables the achievement system even in **non-ironman mode**, **with mods**, and under **any game settings**.  
 I would be very grateful if you could help me update the pattern in the future.
 ![alt text](figures/effect.png)
 # How to use it?

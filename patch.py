@@ -40,6 +40,11 @@ def pattern_to_list(pattern_str):
 
 
 def make_patch(filename):
+
+    # Make Backup
+    shutil.copy2(EU5_PATH, EU5_BACKUP_PATH)
+    print(f"Backup is made: {EU5_BACKUP_PATH}")
+
     # Read
     with open(filename, "rb") as f:
         data = bytearray(f.read())
@@ -66,11 +71,6 @@ def make_patch(filename):
 
     # Write Back
     with open(filename, "wb") as f:
-
-        # Make Backup
-        shutil.copy2(EU5_PATH, EU5_BACKUP_PATH)
-        print(f"Backup is made: {EU5_BACKUP_PATH}")
-
         f.write(data)
         print("EU5 is successfully patched.")
 
