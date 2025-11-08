@@ -8,6 +8,8 @@ I would be very grateful if you could help me update the pattern in the future.
 0. Install Python and ensure the path is configured correctly.
 1. Put this `patcher.py` in the `.../Europa Universalis IV/binaries/`, where `eu5.exe` exists.
 2. Open `cmd` in this folder, and use the command `python patcher.py`.
+   
+You'll see the message “EU5 is successfully patched” if the process completes successfully. After that, you can start a new game with any mods or settings in non-ironman mode. You might notice that the trophy icon appears red in the settings menu at first — just start the game, and it will turn green as shown in the figure.
 
 # Tutorial
 WIP
