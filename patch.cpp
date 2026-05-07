@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -165,8 +166,7 @@ struct PatternByte
 
 struct PatternSearchResult
 {
-    std::optional<size_t> offset;
-    size_t match_count{0};
+    std::vector<size_t> offsets;
 };
 
 /**
@@ -201,18 +201,7 @@ struct PatternSearchResult
 
         if (match)
         {
-            if (result.match_count == 0)
-            {
-                result.offset = i;
-            }
-
-            ++result.match_count;
-
-            if (result.match_count > 1)
-            {
-                // No need to keep scanning; we only care that it is ambiguous.
-                break;
-            }
+            result.offsets.push_back(i);
         }
     }
 
@@ -367,6 +356,23 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
     {
         return fs::path(*fallback);
     }
+#else
+    const char *home = std::getenv("HOME");
+    if (home)
+    {
+        const std::vector<fs::path> candidates = {
+            fs::path(home) / ".local/share/Steam",
+            fs::path(home) / ".steam/steam",
+            fs::path(home) / ".var/app/com.valvesoftware.Steam/.steam/steam",
+        };
+        for (const auto &p : candidates)
+        {
+            if (fs::is_directory(p))
+            {
+                return p;
+            }
+        }
+    }
 #endif
     return std::nullopt;
 }
@@ -407,13 +413,15 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
     return tokens;
 }
 
-[[nodiscard]] std::optional<fs::path> find_steam_library_path(const fs::path &vdf_path,
-                                                              std::string_view target_appid)
+[[nodiscard]] std::vector<fs::path> find_all_steam_libraries_with_app(
+    const fs::path &vdf_path,
+    std::string_view target_appid)
 {
+    std::vector<fs::path> results;
     std::ifstream file(vdf_path);
     if (!file)
     {
-        return std::nullopt;
+        return results;
     }
 
     std::string current_path;
@@ -442,6 +450,7 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
                 continue;
             }
 
+            // 进入 apps 块
             if (tokens[0] == "apps")
             {
                 in_apps_block = true;
@@ -450,13 +459,14 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
         }
 
         // Within "apps" block
+        // 检查 AppID
         if (tokens[0] == target_appid)
         {
-            return fs::path(current_path);
+            results.push_back(fs::path(current_path));
         }
     }
 
-    return std::nullopt;
+    return results;
 }
 
 [[nodiscard]] std::optional<fs::path> get_game_folder(std::string_view name)
@@ -468,19 +478,18 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
     }
 
     const auto library_db = *steam_path_opt / "steamapps" / "libraryfolders.vdf";
-    const auto library_path = find_steam_library_path(library_db, APP_ID);
-    if (!library_path || !fs::is_directory(*library_path))
+    const auto library_paths = find_all_steam_libraries_with_app(library_db, APP_ID);
+    for (const auto &library_path : library_paths)
     {
-        return std::nullopt;
+        const auto game_folder = library_path / "steamapps" / "common" / std::string(name);
+        const auto binaries_path = game_folder / "binaries" / EU5_PATH;
+        if (fs::is_regular_file(binaries_path))
+        {
+            return game_folder;
+        }
     }
 
-    const auto game_folder = *library_path / "steamapps" / "common" / std::string(name);
-    if (!fs::is_directory(game_folder))
-    {
-        return std::nullopt;
-    }
-
-    return game_folder;
+    return std::nullopt;
 }
 
 [[nodiscard]] std::optional<fs::path> locate_eu5()
@@ -520,9 +529,8 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
     auto &data = *data_opt;
 
     std::vector<size_t> offsets;
-    offsets.reserve(PATCH_DEFINITIONS.size());
     std::vector<std::vector<PatternByte>> replacements;
-    replacements.reserve(PATCH_DEFINITIONS.size());
+    std::vector<std::string_view> labels;
 
     // Parse patterns and determine offsets
     for (const auto &patch_def : PATCH_DEFINITIONS)
@@ -530,7 +538,7 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
         const auto pattern = parse_pattern(patch_def.pattern);
         const auto search_result = find_pattern(data, pattern);
 
-        if (search_result.match_count == 0)
+        if (search_result.offsets.empty())
         {
             std::cerr << "Error: " << patch_def.label
                       << " not found. Have you patched it before?\n"
@@ -538,19 +546,16 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
             return 1;
         }
 
-        if (search_result.match_count > 1)
+        const auto replacement = parse_pattern(patch_def.replacement);
+        for (size_t offset : search_result.offsets)
         {
-            std::cerr << "Error: " << patch_def.label
-                      << " pattern is ambiguous. The pattern is ambiguous.\n";
-            return 1;
+            offsets.push_back(offset);
+            replacements.push_back(replacement);
+            labels.push_back(patch_def.label);
         }
-
-        offsets.push_back(*search_result.offset);
-        auto replacement = parse_pattern(patch_def.replacement);
-        replacements.push_back(std::move(replacement));
     }
 
-    // Create backup only after confirming both patterns exist
+    // Create backup only after confirming all patterns exist
     auto backup_path = filepath;
     backup_path += EU5_BACKUP_SUFFIX;
 
@@ -561,9 +566,9 @@ void apply_patch_bytes(std::vector<uint8_t> &data,
     }
     std::cout << "Backup created: " << backup_path << '\n';
 
-    for (size_t i = 0; i < PATCH_DEFINITIONS.size(); ++i)
+    for (size_t i = 0; i < offsets.size(); ++i)
     {
-        apply_patch_bytes(data, offsets[i], replacements[i], PATCH_DEFINITIONS[i].label);
+        apply_patch_bytes(data, offsets[i], replacements[i], labels[i]);
     }
 
     // Write back
