@@ -13,35 +13,52 @@ from typing import Final, Optional
 
 def get_steam_install_path() -> Optional[str]:
     """
-    Get the Steam installation path on Windows by querying the registry.
-    Returns None if Steam is not installed or if not on Windows.
+    Get the Steam installation path.
+    On Windows queries the registry. On Linux checks standard paths.
+    Returns None if Steam is not found.
     """
-    if platform.system() != "Windows":
-        return None
+    system = platform.system()
 
-    try:
-        import winreg
-    except:
-        return None
-
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Valve\\Steam"
-        )
-        path, _ = winreg.QueryValueEx(key, "InstallPath")
-        winreg.CloseKey(key)
-        return path
-    except FileNotFoundError:
+    if system == "Windows":
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Valve\\Steam")
-            path, _ = winreg.QueryValueEx(key, "SteamPath")
+            import winreg
+        except ImportError:
+            return None
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Valve\\Steam"
+            )
+            path, _ = winreg.QueryValueEx(key, "InstallPath")
             winreg.CloseKey(key)
             return path
-        except:
-            return None
+        except FileNotFoundError:
+            try:
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, r"Software\\Valve\\Steam"
+                )
+                path, _ = winreg.QueryValueEx(key, "SteamPath")
+                winreg.CloseKey(key)
+                return path
+            except Exception:
+                return None
+
+    if system == "Linux":
+        candidates = [
+            os.path.expanduser("~/.local/share/Steam"),
+            os.path.expanduser("~/.steam/steam"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.steam/steam"),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return candidate
+        return None
+
+    return None
 
 
-def find_steam_library_path(vdf_path, target_appid: str):
+def find_all_steam_libraries_with_app(vdf_path: str, target_appid: str) -> list[str]:
+    """Return all Steam library paths that contain the given AppID."""
+    results: list[str] = []
     current_path = None
     in_apps_block = False
 
@@ -49,7 +66,6 @@ def find_steam_library_path(vdf_path, target_appid: str):
         for line in f:
             line = line.strip()
 
-            # 解析 path
             if line.startswith('"path"'):
                 # "path"    "E:\SteamLibrary"
                 current_path = line.split('"')[3]
@@ -66,30 +82,34 @@ def find_steam_library_path(vdf_path, target_appid: str):
 
                 # 检查 AppID
                 if line.startswith(f'"{target_appid}"'):
-                    return current_path
+                    if current_path:
+                        results.append(current_path)
 
-    return None
+    return results
 
 
-def get_game_folder(name: str) -> str:
-    """
+def get_game_folder(name: str) -> Optional[str]:
+    """2
     Get the installation folder of a Steam game by its name.
-    Returns empty string if the game is not found.
+    Checks all Steam libraries and returns the first path where the game exists.
+    Returns None if the game is not found.
     """
     steam_path = get_steam_install_path()
     if not steam_path:
         return None
 
     library_db = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
-    library_path = find_steam_library_path(library_db, "3450310")  # EU5
-    if not os.path.isdir(library_path):
+    if not os.path.isfile(library_db):
         return None
 
-    game_folders_path = os.path.join(library_path, "steamapps", "common", name)
-    if not os.path.isdir(game_folders_path):
-        return None
+    library_paths = find_all_steam_libraries_with_app(library_db, "3450310")  # EU5
+    for library_path in library_paths:
+        game_folder = os.path.join(library_path, "steamapps", "common", name)
+        binaries_path = os.path.join(game_folder, "binaries", "eu5.exe")
+        if os.path.isfile(binaries_path):
+            return game_folder
 
-    return game_folders_path
+    return None
 
 
 # Constants
@@ -176,11 +196,15 @@ PATTERN5: Final[str] = (
 PATTERN_REPLACE5: Final[str] = "e8 ?? ?? ?? ?? 80 ?? ?? ?? ?? ?? 09"
 
 
-EU5_PATH: Final[Path] = Path("eu5.exe")
-STEAM_EU5_PATH: Final[Path] = (
-    Path(get_game_folder("Europa Universalis V")) / "binaries" / "eu5.exe"
+SCRIPT_DIR: Final[Path] = Path(__file__).resolve().parent
+
+EU5_PATH: Final[Path] = SCRIPT_DIR / "eu5.exe"
+_game_folder = get_game_folder("Europa Universalis V")
+STEAM_EU5_PATH: Final[Optional[Path]] = (
+    Path(_game_folder) / "binaries" / "eu5.exe" if _game_folder else None
 )
 EU5_BACKUP_SUFFIX: Final[str] = ".backup"
+EU5_BACKUP_PATH: Final[Path] = SCRIPT_DIR / "eu5.exe.backup"
 
 debug_info = False
 
@@ -241,8 +265,8 @@ def create_backup(source: Path, dest: Path) -> None:
         raise PatchError(f"Failed to create backup: {e}") from e
 
 
-def find_pattern(data: bytes, pattern: re.Pattern[bytes]) -> int:
-    """Find the pattern in data and return its offset."""
+def find_pattern(data: bytes, pattern: re.Pattern[bytes]) -> list[int]:
+    """Find the pattern in data and return its offsets."""
     matches = list(pattern.finditer(data))
 
     if len(matches) == 0:
@@ -250,12 +274,8 @@ def find_pattern(data: bytes, pattern: re.Pattern[bytes]) -> int:
             "Pattern not found. Have you patched it before? "
             "If not, the pattern may need to be updated."
         )
-    if len(matches) > 1:
-        raise PatchError(
-            f"Multiple matches found ({len(matches)}). " f"The pattern is ambiguous."
-        )
 
-    return matches[0].start()
+    return [m.start() for m in matches]
 
 
 def apply_patch(data: bytearray, offset: int, replacement: list[int | None]) -> None:
@@ -284,11 +304,11 @@ def make_patch(filepath: Path) -> None:
     # Find every pattern and prepare replacements before touching disk
     patch_jobs: list[tuple[PatchDefinition, int, list[int | None]]] = []
     for patch_def in PATCHES:
-        # print(patch_def.pattern, "\n")
         regex = pattern_to_regex(patch_def.pattern)
-        offset = find_pattern(data, regex)
+        offsets = find_pattern(data, regex)
         replacement = pattern_to_list(patch_def.replacement)
-        patch_jobs.append((patch_def, offset, replacement))
+        for offset in offsets:
+            patch_jobs.append((patch_def, offset, replacement))
 
     # Create backup only after both patterns are confirmed
     create_backup(filepath, filepath.with_name(filepath.name + EU5_BACKUP_SUFFIX))
@@ -311,8 +331,8 @@ def main() -> int:
     """Main entry point."""
     if EU5_PATH.exists():
         path = EU5_PATH
-        print(f"Path: ./{EU5_PATH}")
-    elif STEAM_EU5_PATH.exists():
+        print(f"Path: {EU5_PATH}")
+    elif STEAM_EU5_PATH and STEAM_EU5_PATH.exists():
         path = STEAM_EU5_PATH
         print(f"Path: {STEAM_EU5_PATH}")
     else:
