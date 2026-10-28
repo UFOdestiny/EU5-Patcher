@@ -3,8 +3,8 @@
  *
  * Location strategy:
  *   CanGetAchievements string -> registration xref -> callback -> predicate
- *   Branch-2 -> checksum callee
- *   IsGameRuleEnabled string -> registration xref -> callback
+ *   Branch-2 -> checksum callee, or the checksum predicate itself
+ *   IsGameRuleEnabled string -> registration -> callback -> boolean callee
  *
  * Patch #1/#2/#3/#4 all replace the target function entry with:
  *   mov eax, 1
@@ -125,6 +125,16 @@ namespace
         uint32_t rva{};
     };
 
+    struct RegisteredCallback
+    {
+        uint32_t rva{};
+        bool marshalled{};
+        bool operator<(const RegisteredCallback &other) const
+        {
+            return std::tie(rva, marshalled) < std::tie(other.rva, other.marshalled);
+        }
+    };
+
     [[nodiscard]] uint16_t read_u16(const std::vector<uint8_t> &data, size_t offset)
     {
         if (offset + sizeof(uint16_t) > data.size())
@@ -185,17 +195,23 @@ namespace
     }
 
     [[nodiscard]] bool write_file(const fs::path &filepath,
-                                  const std::vector<uint8_t> &data)
+                                  const std::vector<uint8_t> &data,
+                                  const std::vector<PatchJob> &jobs)
     {
-        std::ofstream file(filepath, std::ios::binary | std::ios::trunc);
+        std::fstream file(filepath, std::ios::binary | std::ios::in | std::ios::out);
         if (!file)
             return false;
 
-        if (!data.empty())
+        for (const auto &job : jobs)
         {
-            file.write(reinterpret_cast<const char *>(data.data()),
-                       static_cast<std::streamsize>(data.size()));
+            file.seekp(static_cast<std::streamoff>(job.offset));
+            file.write(reinterpret_cast<const char *>(data.data() + job.offset),
+                       static_cast<std::streamsize>(RETURN_TRUE.size()));
+            if (!file)
+                return false;
         }
+        file.flush();
+        file.close();
         return file.good();
     }
 
@@ -653,7 +669,7 @@ namespace
         return results;
     }
 
-    [[nodiscard]] uint32_t find_registered_callback(
+    [[nodiscard]] RegisteredCallback find_registered_callback(
         const std::vector<uint8_t> &data,
         const PESection &text,
         const std::vector<RuntimeFunctionRange> &runtime_ranges,
@@ -661,44 +677,94 @@ namespace
         uint32_t string_rva)
     {
         const auto range = function_range_for_rva(
-            string_xref_rva, text, runtime_ranges, 0x20, 0x180);
-
-        std::vector<RipTarget> candidates;
-        for (const auto &item : iter_rip_lea_targets(
-                 data, text, {0x48, 0x8D, 0x15}, string_xref_rva + 7, range.end))
+            string_xref_rva, text, runtime_ranges, 0x20, 0x800);
+        uint32_t end = std::min(range.end, string_xref_rva + 0x800);
+        const auto rdx_targets = iter_rip_lea_targets(
+            data, text, {0x48, 0x8D, 0x15}, string_xref_rva + 7, end);
+        // Do not cross into the next registration in a large initializer.
+        for (const auto &item : rdx_targets)
         {
-            if (item.target_rva != string_rva && text.contains_rva(item.target_rva))
-                candidates.push_back(item);
+            if (item.target_rva == string_rva || !text.contains_rva(item.target_rva))
+            {
+                end = item.instruction_rva;
+                break;
+            }
         }
 
-        if (candidates.empty())
+        std::set<RegisteredCallback> candidates;
+        for (const auto &item : rdx_targets)
+        {
+            if (item.instruction_rva < end && text.contains_rva(item.target_rva))
+                candidates.insert({item.target_rva, false});
+        }
+
+        const auto rcx_targets = iter_rip_lea_targets(
+            data, text, {0x48, 0x8D, 0x0D}, string_xref_rva + 7, end);
+        for (const auto &item : iter_rip_lea_targets(
+                 data, text, {0x4C, 0x8D, 0x05}, string_xref_rva + 7, end))
+        {
+            if (text.contains_rva(item.target_rva) &&
+                std::any_of(rcx_targets.begin(), rcx_targets.end(),
+                            [&](const RipTarget &rcx)
+                            { return rcx.instruction_rva + 7 == item.instruction_rva &&
+                                     text.contains_rva(rcx.target_rva); }))
+                candidates.insert({item.target_rva, false});
+        }
+
+        // Inlined registration stores the marshalling callback in a descriptor.
+        for (const auto &item : iter_rip_lea_targets(
+                 data, text, {0x48, 0x8D, 0x05}, string_xref_rva + 7, end))
+        {
+            const size_t off = text.raw_offset + item.instruction_rva - text.rva;
+            if (text.contains_rva(item.target_rva) && off + 10 <= data.size() &&
+                data[off + 7] == 0x48 && data[off + 8] == 0x89 && data[off + 9] == 0x85)
+                candidates.insert({item.target_rva, true});
+        }
+
+        if (candidates.size() != 1)
         {
             std::ostringstream oss;
-            oss << "Could not resolve registered callback after string xref at RVA 0x"
-                << std::hex << string_xref_rva << '.';
+            oss << "Expected one callback in registration at RVA 0x"
+                << std::hex << string_xref_rva << ", found " << std::dec
+                << candidates.size() << '.';
             throw PatchError(oss.str());
         }
+        return *candidates.begin();
+    }
 
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const RipTarget &a, const RipTarget &b)
-                  {
-                      return a.instruction_rva < b.instruction_rva;
-                  });
-
-        if (debug_info && candidates.size() > 1)
+    [[nodiscard]] uint32_t resolve_game_rule_predicate(
+        const std::vector<uint8_t> &data,
+        const std::vector<PESection> &sections,
+        const PESection &text,
+        const std::vector<RuntimeFunctionRange> &runtime_ranges,
+        RegisteredCallback callback)
+    {
+        if (!callback.marshalled)
+            return callback.rva;
+        const auto range = function_range_for_rva(callback.rva, text, runtime_ranges);
+        const size_t start = rva_to_raw_offset(sections, range.begin);
+        const size_t end = std::min(data.size(), start + range.end - range.begin);
+        const std::array<uint8_t, 6> prefix{0x48, 0x89, 0xF1, 0x31, 0xD2, 0xE8};
+        std::set<uint32_t> candidates;
+        for (size_t pos = start; pos + 12 <= end; ++pos)
         {
-            std::cout << "Warning: multiple callback candidates after RVA 0x"
-                      << std::hex << string_xref_rva << ": ";
-            for (size_t i = 0; i < candidates.size(); ++i)
-            {
-                if (i)
-                    std::cout << ", ";
-                std::cout << "0x" << candidates[i].target_rva;
-            }
-            std::cout << std::dec << '\n';
+            if (!std::equal(prefix.begin(), prefix.end(), data.begin() + pos))
+                continue;
+            size_t suffix = pos + 10;
+            if (data[suffix] == 0x90)
+                ++suffix;
+            if (suffix + 2 > end || data[suffix] != 0x89 || data[suffix + 1] != 0xC3)
+                continue;
+            const int64_t target = static_cast<int64_t>(range.begin) + pos - start +
+                                   10 + read_i32(data, pos + 6);
+            if (text.contains_rva(target) &&
+                std::any_of(runtime_ranges.begin(), runtime_ranges.end(),
+                            [&](const RuntimeFunctionRange &r) { return r.begin == target; }))
+                candidates.insert(static_cast<uint32_t>(target));
         }
-
-        return candidates.front().target_rva;
+        if (candidates.size() != 1)
+            throw PatchError("Could not uniquely resolve IsGameRuleEnabled boolean callee.");
+        return *candidates.begin();
     }
 
     [[nodiscard]] uint32_t resolve_can_get_achievements_predicate(
@@ -708,7 +774,7 @@ namespace
         uint32_t callback_rva)
     {
         const auto range = function_range_for_rva(
-            callback_rva, text, runtime_ranges, 0, 0x60);
+            callback_rva, text, runtime_ranges, 0, 0x30);
 
         std::vector<RipTarget> candidates;
         // lea rcx, [rip + disp32]
@@ -839,7 +905,7 @@ namespace
         end_off = std::min(end_off, data.size());
         std::set<uint32_t> found;
 
-        // Match local instances of: 80 /7 [base+disp32], 00
+        // Match local instances of: 80 /7 [base+disp32], 00/01 (no SIB).
         // and score accesses to the checksum state neighborhood.
         for (size_t pos = start_off; pos + 7 <= end_off; ++pos)
         {
@@ -849,7 +915,7 @@ namespace
             const uint8_t modrm = data[pos + 1];
             const uint8_t mod = (modrm >> 6) & 0x3;
             const uint8_t reg = (modrm >> 3) & 0x7;
-            if (mod != 0x2 || reg != 0x7 || data[pos + 6] != 0)
+            if (mod != 0x2 || reg != 0x7 || (modrm & 7) == 4 || data[pos + 6] > 1)
                 continue;
 
             const uint32_t disp = read_u32(data, pos + 2);
@@ -888,11 +954,11 @@ namespace
                 predicate_rva, text, runtime_ranges, 0, 0x220);
 
             std::unordered_set<uint32_t> seen_targets;
-            for (const auto &item : iter_rel32_control_targets(
-                     data, text, range.begin, range.end))
+            auto targets = iter_rel32_control_targets(data, text, range.begin, range.end);
+            targets.insert(targets.begin(), {predicate_rva, predicate_rva, 0});
+            for (const auto &item : targets)
             {
-                if (item.target_rva == predicate_rva ||
-                    !seen_targets.insert(item.target_rva).second)
+                if (!seen_targets.insert(item.target_rva).second)
                 {
                     continue;
                 }
@@ -987,8 +1053,13 @@ namespace
                              uint32_t target_rva)
     {
         const size_t offset = rva_to_raw_offset(sections, target_rva);
-        if (offset + RETURN_TRUE.size() > data.size())
-            throw PatchError("Patch target extends past the end of the file.");
+        const auto &text = get_section(sections, ".text");
+        if (offset < text.raw_offset || offset + RETURN_TRUE.size() >
+                std::min<uint64_t>(data.size(), static_cast<uint64_t>(text.raw_offset) + text.raw_size))
+            throw PatchError("Patch target extends past executable section data.");
+        if (std::any_of(jobs.begin(), jobs.end(),
+                        [&](const PatchJob &job) { return job.offset == offset; }))
+            return;
 
         if (is_return_true_at_rva(data, sections, target_rva))
         {
@@ -1024,10 +1095,10 @@ namespace
         std::vector<uint32_t> predicates;
         for (const auto &xref : can_xrefs)
         {
-            const uint32_t callback_rva = find_registered_callback(
+            const auto callback = find_registered_callback(
                 data, text, runtime_ranges, xref.instruction_rva, xref.target_rva);
             const uint32_t predicate_rva = resolve_can_get_achievements_predicate(
-                data, text, runtime_ranges, callback_rva);
+                data, text, runtime_ranges, callback.rva);
 
             if (std::find(predicates.begin(), predicates.end(), predicate_rva) == predicates.end())
                 predicates.push_back(predicate_rva);
@@ -1071,11 +1142,13 @@ namespace
         add_return_true_job(jobs, data, sections,
                             "Patch #1 (CanGetAchievements Branch-1)", branch1_rva);
         add_return_true_job(jobs, data, sections,
-                            "Patch #3 (checksum via Branch-2)", checksum_rva);
+                            branch2_rva == checksum_rva
+                                ? "Patch #2/#3 (CanGetAchievements Branch-2 / checksum)"
+                                : "Patch #3 (checksum via Branch-2)", checksum_rva);
         add_return_true_job(jobs, data, sections,
                             "Patch #2 (CanGetAchievements Branch-2)", branch2_rva);
 
-        // IsGameRuleEnabled -> registered callback.
+        // Preserve result marshalling; patch the boolean callee when needed.
         const auto rule_rvas = find_string_rvas(
             data, sections, IS_GAME_RULE_ENABLED_ANCHOR);
         const auto rule_xrefs = find_anchor_xrefs(data, text, rule_rvas);
@@ -1085,10 +1158,12 @@ namespace
         std::vector<uint32_t> callbacks;
         for (const auto &xref : rule_xrefs)
         {
-            const uint32_t callback_rva = find_registered_callback(
+            const auto callback = find_registered_callback(
                 data, text, runtime_ranges, xref.instruction_rva, xref.target_rva);
-            if (std::find(callbacks.begin(), callbacks.end(), callback_rva) == callbacks.end())
-                callbacks.push_back(callback_rva);
+            const uint32_t target = resolve_game_rule_predicate(
+                data, sections, text, runtime_ranges, callback);
+            if (std::find(callbacks.begin(), callbacks.end(), target) == callbacks.end())
+                callbacks.push_back(target);
         }
 
         if (callbacks.size() != 1)
@@ -1110,7 +1185,7 @@ namespace
         }
 
         add_return_true_job(jobs, data, sections,
-                            "Patch #4 (IsGameRuleEnabled via string xref)",
+                            "Patch #4 (IsGameRuleEnabled predicate)",
                             callbacks.front());
 
         return jobs;
@@ -1146,7 +1221,7 @@ namespace
         }
     }
 
-    [[nodiscard]] int make_patch(const fs::path &filepath)
+    [[nodiscard]] int make_patch(const fs::path &filepath, bool dry_run = false)
     {
         auto data_opt = read_file(filepath);
         if (!data_opt)
@@ -1163,6 +1238,16 @@ namespace
 
             // Locate and validate every target before changing any bytes.
             const auto patch_jobs = prepare_patch_jobs(data, sections);
+
+            if (dry_run)
+            {
+                for (const auto &job : patch_jobs)
+                    std::cout << job.label << ": offset 0x" << std::hex << job.offset
+                              << " (RVA 0x" << job.rva << ")\n" << std::dec;
+                std::cout << "Dry run: " << patch_jobs.size()
+                          << " pending function patches; no files written.\n";
+                return 0;
+            }
 
             if (patch_jobs.empty())
             {
@@ -1183,7 +1268,7 @@ namespace
             for (const auto &job : patch_jobs)
                 apply_patch(data, job);
 
-            if (!write_file(filepath, data))
+            if (!write_file(filepath, data, patch_jobs))
             {
                 std::cerr << "Error: Failed to write patched file.\n";
                 return 1;
@@ -1201,24 +1286,56 @@ namespace
 
 } // namespace
 
-int main()
+int main(int argc, char *argv[])
 {
-    const auto target_path_opt = locate_eu5();
+    bool dry_run = false;
+    bool pause = true;
+    std::optional<fs::path> explicit_path;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string_view arg{argv[i]};
+        if (arg == "--dry-run")
+            dry_run = true;
+        else if (arg == "--no-pause")
+            pause = false;
+        else if (arg == "--debug")
+            debug_info = true;
+        else if (arg == "--help" || arg == "-h")
+        {
+            std::cout << "Usage: patch.exe [--dry-run] [--no-pause] [--debug] [eu5.exe path]\n";
+            return 0;
+        }
+        else if (arg.substr(0, 1) == "-" || explicit_path)
+        {
+            std::cerr << "Unknown argument: " << arg << '\n';
+            return 1;
+        }
+        else
+            explicit_path = fs::path(argv[i]);
+    }
+    pause = pause && !dry_run;
+    const auto target_path_opt = explicit_path ? explicit_path : locate_eu5();
     if (!target_path_opt)
     {
         std::cerr << "eu5.exe not found.\n"
                   << "Place this executable in .../Europa Universalis V/binaries/\n";
-        std::cout << "Press Enter to exit...";
-        std::cin.get();
+        if (pause)
+        {
+            std::cout << "Press Enter to exit...";
+            std::cin.get();
+        }
         return 1;
     }
 
     const auto &target_path = *target_path_opt;
     std::cout << "Path: " << target_path << '\n';
 
-    const int result = make_patch(target_path);
+    const int result = make_patch(target_path, dry_run);
 
-    std::cout << "Press Enter to exit...";
-    std::cin.get();
+    if (pause)
+    {
+        std::cout << "Press Enter to exit...";
+        std::cin.get();
+    }
     return result;
 }

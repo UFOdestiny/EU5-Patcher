@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """EU5 Patcher - Enable Achievements Unconditionally"""
 
+import argparse
 import os
 import platform
 import re
@@ -119,14 +120,14 @@ CAN_GET_ACHIEVEMENTS_ANCHOR: Final[bytes] = b"CanGetAchievements\x00"
 IS_GAME_RULE_ENABLED_ANCHOR: Final[bytes] = b"IsGameRuleEnabled\x00"
 RETURN_TRUE: Final[bytes] = b"\xb8\x01\x00\x00\x00\xc3"
 
-# Patch #3 remains a function-level patch because checksum has other callers.
-# It is now located from CanGetAchievements Branch-2 and forced to return true.
+# Checksum is either called by Branch-2 or registered directly as its predicate.
 # These field offsets are used only to validate that the resolved callee has the
 # expected checksum-like structure; they are not used as a global signature.
 CHECKSUM_STATE_OFFSETS: Final[frozenset[int]] = frozenset(
     {0x130, 0x131, 0x132, 0x133, 0x134, 0x139}
 )
 CHECKSUM_MIN_STATE_FIELDS: Final[int] = 4
+CHECKSUM_PATCHED_MIN_STATE_FIELDS: Final[int] = 3
 
 
 SCRIPT_DIR: Final[Path] = Path(__file__).resolve().parent
@@ -166,6 +167,12 @@ class PatchJob:
     label: str
     offset: int
     replacement: tuple[int | None, ...]
+
+
+@dataclass(frozen=True)
+class RegisteredCallback:
+    rva: int
+    marshalled: bool = False
 
 
 class PatchError(Exception):
@@ -294,14 +301,13 @@ def iter_rip_lea_targets(
     start_off = text.raw_offset + (start_rva - text.rva)
     end_off = text.raw_offset + (end_rva - text.rva)
 
-    pos = start_off
-    while pos + 7 <= end_off:
-        if data[pos : pos + 3] == opcode:
-            disp = struct.unpack_from("<i", data, pos + 3)[0]
-            insn_rva = text.rva + (pos - text.raw_offset)
-            target_rva = insn_rva + 7 + disp
-            yield insn_rva, target_rva
-        pos += 1
+    # bytes.find runs the large .text scan in native code.
+    pos = data.find(opcode, start_off, end_off)
+    while pos >= 0 and pos + 7 <= end_off:
+        disp = struct.unpack_from("<i", data, pos + 3)[0]
+        insn_rva = text.rva + (pos - text.raw_offset)
+        yield insn_rva, insn_rva + 7 + disp
+        pos = data.find(opcode, pos + 1, end_off)
 
 
 def parse_runtime_function_ranges(
@@ -364,39 +370,81 @@ def find_registered_callback(
     runtime_ranges: list[tuple[int, int]],
     string_xref_rva: int,
     string_rva: int,
-) -> int:
-    """
-    Starting from the string xref inside the registration function, find the
-    later LEA RDX,[RIP+callback] whose target points back into .text.
-    """
+) -> RegisteredCallback:
+    """Resolve RDX, RCX/R8, or stored-RAX registration within one local block."""
     _begin, end = function_range_for_rva(
         string_xref_rva,
         text,
         runtime_ranges,
         fallback_before=0x20,
-        fallback_after=0x180,
+        fallback_after=0x800,
     )
-
-    candidates: list[tuple[int, int]] = []
-    for insn_rva, target_rva in iter_rip_lea_targets(
+    end = min(end, string_xref_rva + 0x800)
+    # A registration function can contain thousands of unrelated callbacks.
+    # Stop at the next RIP-relative data/string argument, never borrow its target.
+    rdx_targets = list(iter_rip_lea_targets(
         data, text, b"\x48\x8d\x15", string_xref_rva + 7, end
+    ))
+    for insn_rva, target_rva in rdx_targets:
+        if target_rva == string_rva or not text.contains_rva(target_rva):
+            end = insn_rva
+            break
+
+    candidates: set[RegisteredCallback] = set()
+    for insn_rva, target_rva in rdx_targets:
+        if insn_rva < end and text.contains_rva(target_rva):
+            candidates.add(RegisteredCallback(target_rva))
+
+    # New direct predicate + wrapper registration: lea rcx,predicate; lea r8,wrapper.
+    rcx_targets = list(iter_rip_lea_targets(
+        data, text, b"\x48\x8d\x0d", string_xref_rva + 7, end
+    ))
+    for insn_rva, target_rva in iter_rip_lea_targets(
+        data, text, b"\x4c\x8d\x05", string_xref_rva + 7, end
     ):
-        if target_rva != string_rva and text.contains_rva(target_rva):
-            candidates.append((insn_rva, target_rva))
+        if text.contains_rva(target_rva) and any(
+            x + 7 == insn_rva and text.contains_rva(y) for x, y in rcx_targets
+        ):
+            candidates.add(RegisteredCallback(target_rva))
 
-    if not candidates:
+    # Inlined registration stores the marshalling callback in its descriptor.
+    for insn_rva, target_rva in iter_rip_lea_targets(
+        data, text, b"\x48\x8d\x05", string_xref_rva + 7, end
+    ):
+        off = text.raw_offset + insn_rva - text.rva
+        if text.contains_rva(target_rva) and data[off + 7:off + 10] == b"\x48\x89\x85":
+            candidates.add(RegisteredCallback(target_rva, True))
+
+    if len(candidates) != 1:
         raise PatchError(
-            f"Could not resolve registered callback after string xref at {string_xref_rva:#x}."
+            f"Expected one callback in registration at {string_xref_rva:#x}, "
+            f"found {len(candidates)}."
         )
+    return next(iter(candidates))
 
-    # The callback argument is normally the nearest later RIP-relative LEA into .text.
-    candidates.sort(key=lambda item: item[0])
-    if debug_info and len(candidates) > 1:
-        print(
-            f"Warning: multiple callback candidates after {string_xref_rva:#x}: "
-            + ", ".join(f"{target:#x}" for _, target in candidates)
-        )
-    return candidates[0][1]
+
+def resolve_game_rule_predicate(
+    data: bytes,
+    sections: list[PESection],
+    text: PESection,
+    runtime_ranges: list[tuple[int, int]],
+    callback: RegisteredCallback,
+) -> int:
+    """Keep the marshaller's output writes; patch the boolean callee it invokes."""
+    if not callback.marshalled:
+        return callback.rva  # Legacy boolean callback.
+    begin, end = function_range_for_rva(callback.rva, text, runtime_ranges)
+    off = rva_to_raw_offset(sections, begin)
+    body = data[off:off + end - begin]
+    candidates = set()
+    # mov rcx,rsi; xor edx,edx; call predicate; [nop]; mov ebx,eax
+    for m in re.finditer(rb"\x48\x89\xf1\x31\xd2\xe8(.{4})\x90?\x89\xc3", body, re.DOTALL):
+        target = begin + m.start() + 10 + struct.unpack("<i", m[1])[0]
+        if any(a == target for a, _ in runtime_ranges) and text.contains_rva(target):
+            candidates.add(target)
+    if len(candidates) != 1:
+        raise PatchError("Could not uniquely resolve IsGameRuleEnabled boolean callee.")
+    return next(iter(candidates))
 
 
 def resolve_can_get_achievements_predicate(
@@ -411,7 +459,7 @@ def resolve_can_get_achievements_predicate(
         lea rcx, [rip + predicate]
     """
     _begin, end = function_range_for_rva(
-        callback_rva, text, runtime_ranges, fallback_before=0, fallback_after=0x60
+        callback_rva, text, runtime_ranges, fallback_before=0, fallback_after=0x30
     )
 
     candidates: list[tuple[int, int]] = []
@@ -471,7 +519,7 @@ def checksum_structure_score(
     candidate_rva: int,
 ) -> tuple[int, frozenset[int]]:
     """
-    Score a candidate checksum function by looking for CMP byte ptr [reg+disp32],0
+    Score a candidate checksum function by looking for CMP byte ptr [reg+disp32],0/1
     accesses to the known state-field neighborhood (+0x130..+0x139).
 
     This is deliberately a local structural validation after resolving a callee
@@ -499,7 +547,7 @@ def checksum_structure_score(
             modrm = data[pos + 1]
             mod = (modrm >> 6) & 0x3
             reg = (modrm >> 3) & 0x7
-            if mod == 0x2 and reg == 0x7 and data[pos + 6] == 0:
+            if mod == 0x2 and reg == 0x7 and (modrm & 7) != 4 and data[pos + 6] in (0, 1):
                 disp = struct.unpack_from("<I", data, pos + 2)[0]
                 if disp in CHECKSUM_STATE_OFFSETS:
                     found.add(disp)
@@ -518,7 +566,7 @@ def resolve_branch2_and_checksum(
     """
     Identify CanGetAchievements Branch-2 and its checksum callee.
 
-    For each resolved predicate, inspect its direct CALL/JMP rel32 targets.  The
+    For each resolved predicate, inspect itself and its direct CALL/JMP targets. The
     checksum callee is selected by local structural validation of the target
     function.  This continues to work when Branch-2/checksum were already
     patched at their entries because the original function bodies remain in the
@@ -537,10 +585,11 @@ def resolve_branch2_and_checksum(
         )
 
         seen_targets: set[int] = set()
-        for insn_rva, target_rva, opcode in iter_rel32_control_targets(
-            data, text, begin, end
-        ):
-            if target_rva == predicate_rva or target_rva in seen_targets:
+        targets = [(predicate_rva, predicate_rva, 0)] + list(
+            iter_rel32_control_targets(data, text, begin, end)
+        )
+        for insn_rva, target_rva, opcode in targets:
+            if target_rva in seen_targets:
                 continue
             seen_targets.add(target_rva)
 
@@ -553,7 +602,11 @@ def resolve_branch2_and_checksum(
             score, fields = checksum_structure_score(
                 data, sections, text, runtime_ranges, target_rva
             )
-            if score >= CHECKSUM_MIN_STATE_FIELDS:
+            off = rva_to_raw_offset(sections, target_rva)
+            minimum = (CHECKSUM_PATCHED_MIN_STATE_FIELDS
+                       if data[off:off + len(RETURN_TRUE)] == RETURN_TRUE
+                       else CHECKSUM_MIN_STATE_FIELDS)
+            if score >= minimum:
                 matches.append((predicate_rva, target_rva, score, fields, insn_rva))
 
     if debug_info:
@@ -597,6 +650,12 @@ def add_return_true_job(
     target_rva: int,
 ) -> None:
     offset = rva_to_raw_offset(sections, target_rva)
+    text = get_section(sections, ".text")
+    if not (text.raw_offset <= offset and
+            offset + len(RETURN_TRUE) <= min(len(data), text.raw_offset + text.raw_size)):
+        raise PatchError("Patch target extends past executable section data.")
+    if any(job.offset == offset for job in jobs):
+        return  # Branch-2 and checksum can share the same entry.
     if data[offset : offset + len(RETURN_TRUE)] == RETURN_TRUE:
         print(f"{label} already patched at RVA {target_rva:#x}.")
         return
@@ -610,7 +669,8 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
     Patch #1: CanGetAchievements Branch-1 -> return true
     Patch #2: CanGetAchievements Branch-2 -> return true
     Patch #3: checksum called by Branch-2 -> return true
-    Patch #4: IsGameRuleEnabled callback -> return true
+    Patch #4: IsGameRuleEnabled boolean predicate -> return true
+    Branch-2 and checksum can be the same function and are patched once.
     """
     text = get_section(sections, ".text")
     runtime_ranges = parse_runtime_function_ranges(data, sections)
@@ -626,11 +686,11 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
 
     predicates: list[int] = []
     for xref_rva, string_rva in can_xrefs:
-        callback_rva = find_registered_callback(
+        callback = find_registered_callback(
             data, text, runtime_ranges, xref_rva, string_rva
         )
         predicate_rva = resolve_can_get_achievements_predicate(
-            data, text, runtime_ranges, callback_rva
+            data, text, runtime_ranges, callback.rva
         )
         if predicate_rva not in predicates:
             predicates.append(predicate_rva)
@@ -668,7 +728,8 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
         jobs,
         data,
         sections,
-        "Patch #3 (checksum via Branch-2)",
+        ("Patch #2/#3 (CanGetAchievements Branch-2 / checksum)"
+         if branch2_rva == checksum_rva else "Patch #3 (checksum via Branch-2)"),
         checksum_rva,
     )
     add_return_true_job(
@@ -679,7 +740,7 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
         branch2_rva,
     )
 
-    # IsGameRuleEnabled directly registers the function we want to force true.
+    # Preserve result marshalling when registration uses an output callback.
     rule_rvas = find_string_rvas(data, sections, IS_GAME_RULE_ENABLED_ANCHOR)
     rule_xrefs = find_anchor_xrefs(data, text, rule_rvas)
     if not rule_xrefs:
@@ -687,11 +748,12 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
 
     callbacks: list[int] = []
     for xref_rva, string_rva in rule_xrefs:
-        callback_rva = find_registered_callback(
+        callback = find_registered_callback(
             data, text, runtime_ranges, xref_rva, string_rva
         )
-        if callback_rva not in callbacks:
-            callbacks.append(callback_rva)
+        target = resolve_game_rule_predicate(data, sections, text, runtime_ranges, callback)
+        if target not in callbacks:
+            callbacks.append(target)
 
     if len(callbacks) != 1:
         raise PatchError(
@@ -703,14 +765,14 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
         jobs,
         data,
         sections,
-        "Patch #4 (IsGameRuleEnabled via string xref)",
+        "Patch #4 (IsGameRuleEnabled predicate)",
         callbacks[0],
     )
 
     return jobs
 
 
-def make_patch(filepath: Path) -> None:
+def make_patch(filepath: Path, *, dry_run: bool = False) -> None:
     """Patch the target executable."""
     try:
         data = bytearray(filepath.read_bytes())
@@ -722,6 +784,13 @@ def make_patch(filepath: Path) -> None:
     # Resolve every target from the untouched image before any bytes are changed.
     # Patch #1/#2/#3 share the CanGetAchievements anchor/call chain; #4 uses its own anchor.
     patch_jobs = prepare_patch_jobs(data, sections)
+
+    if dry_run:
+        for job in patch_jobs:
+            rva = raw_offset_to_rva(sections, job.offset)
+            print(f"{job.label}: offset {job.offset:#x} (RVA {rva:#x})")
+        print(f"Dry run: {len(patch_jobs)} pending function patches; no files written.")
+        return
 
     if not patch_jobs:
         print("\nAll patches are already applied.")
@@ -737,7 +806,12 @@ def make_patch(filepath: Path) -> None:
         apply_patch(data, job.offset, job.replacement)
 
     try:
-        filepath.write_bytes(data)
+        # Preserve file length and write only the validated function entries.
+        # Truncating/recreating a large installed PE is unnecessary.
+        with filepath.open("r+b") as target:
+            for job in patch_jobs:
+                target.seek(job.offset)
+                target.write(data[job.offset:job.offset + len(job.replacement)])
         print("\nEU5 is successfully patched.")
     except OSError as e:
         raise PatchError(f"Failed to write file: {e}") from e
@@ -745,7 +819,19 @@ def make_patch(filepath: Path) -> None:
 
 def main() -> int:
     """Main entry point."""
-    if EU5_PATH.exists():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path", nargs="?", type=Path, help="explicit eu5.exe path")
+    parser.add_argument("--dry-run", action="store_true", help="validate targets without writing")
+    parser.add_argument("--no-pause", action="store_true", help="exit without waiting for Enter")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+    global debug_info
+    debug_info = args.debug
+    pause = not (args.no_pause or args.dry_run)
+    if args.path:
+        path = args.path
+        print(f"Path: {path}")
+    elif EU5_PATH.exists():
         path = EU5_PATH
         print(f"Path: {EU5_PATH}")
     elif STEAM_EU5_PATH and STEAM_EU5_PATH.exists():
@@ -758,16 +844,19 @@ def main() -> int:
             "or install the game via Steam."
         )
         print(f"Expected paths:\n - {EU5_PATH}\n - {STEAM_EU5_PATH}")
-        input("Press Enter to exit...")
+        if pause:
+            input("Press Enter to exit...")
         return 1
     try:
-        make_patch(path)
+        make_patch(path, dry_run=args.dry_run)
     except PatchError as e:
         print(f"Error: {e}")
-        input("Press Enter to exit...")
+        if pause:
+            input("Press Enter to exit...")
         return 1
 
-    input("Press Enter to exit...")
+    if pause:
+        input("Press Enter to exit...")
     return 0
 
 

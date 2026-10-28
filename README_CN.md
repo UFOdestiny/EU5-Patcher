@@ -74,13 +74,11 @@ patch.exe
 Path: "E:\\\\SteamLibrary\\steamapps\\common\\Europa Universalis V\\binaries\\eu5.exe"
 Backup created: "E:\\\\SteamLibrary\\steamapps\\common\\Europa Universalis V\\binaries\\eu5.exe.backup"
 
-Patch #1 (CanGetAchievements Branch-1) found at offset: 0x729bb0 (RVA 0x72a7b0)
+Patch #1 (CanGetAchievements Branch-1) found at offset: 0x1a1360 (RVA 0x1a1f60)
 
-Patch #3 (checksum via Branch-2) found at offset: 0x1f6ae70 (RVA 0x1f6ba70)
+Patch #2/#3 (CanGetAchievements Branch-2 / checksum) found at offset: 0x3086230 (RVA 0x3086e30)
 
-Patch #2 (CanGetAchievements Branch-2) found at offset: 0x3fa7480 (RVA 0x3fa8080)
-
-Patch #4 (IsGameRuleEnabled via string xref) found at offset: 0x786810 (RVA 0x787410)
+Patch #4 (IsGameRuleEnabled predicate) found at offset: 0x4d72f20 (RVA 0x4d73b20)
 
 EU5 is successfully patched.
 Press Enter to exit...
@@ -92,40 +90,33 @@ Press Enter to exit...
 
 ```text
 "CanGetAchievements"
-        │
-        └─ RIP-relative XREF
-            │
-            ├─ Registration #1
-            │   └─ Callback
-            │       └─ Predicate
-            │           └─ Patch #1 → return true
-            │
-            └─ Registration #2
-                └─ Callback
-                    └─ Predicate
-                        │
-                        ├─ 识别为 Branch-2
-                        │
-                        ├─ Patch #2 → return true
-                        │
-                        └─ call/jmp
-                            └─ checksum()
-                                └─ Patch #3 → return true
-
+    -> Registration #1 -> callback -> predicate -> Patch #1
+    -> Registration #2 -> callback -> predicate -> Patch #2
+                                     |
+                                     +-> checksum -> Patch #3
+                                         (can be the predicate itself)
 
 "IsGameRuleEnabled"
-        │
-        └─ RIP-relative XREF
-            └─ Registration
-                └─ Callback
-                    └─ Predicate
-                        └─ Patch #4 → return true
+    -> registration -> callback -> boolean callee -> Patch #4
+                       (preserve output marshalling)
 
+B8 01 00 00 00 C3     mov eax, 1; ret
+```
 
-补丁结果：
-    B8 01 00 00 00 C3
-    mov eax, 1
-    ret
+新版中 Branch-2 与 checksum 是同一个函数，合并为一次写入；旧的独立调用结构仍受支持。游戏规则的包装回调需要将布尔结果写入输出对象，因此改为补丁其布尔被调函数。先定位并验证全部目标，再备份并仅写入对应入口的 6 字节；定位失败时不写文件。
+
+---
+
+## 🧪 回归验证
+
+```powershell
+# 合成 PE 的新旧注册结构测试
+python -m unittest discover -s tests -v
+
+# 同时验证 C++ 与真实游戏文件（只操作临时副本）
+$env:EU5_CPP_PATCHER = (Resolve-Path .\patch.exe).Path
+$env:EU5_TEST_EXE = 'E:\SteamLibrary\steamapps\common\Europa Universalis V\binaries\eu5.exe'
+python -m unittest discover -s tests -v
 ```
 
 ---

@@ -1,3 +1,6 @@
 .vscode
 patch.obj
 compile.lnk
+__pycache__/
+tests
+VALIDATION.md
