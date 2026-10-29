@@ -73,9 +73,17 @@ Backup created: "E:\\\\SteamLibrary\\steamapps\\common\\Europa Universalis V\\bi
 
 Patch #1 (CanGetAchievements Branch-1) found at offset: 0x1a1360 (RVA 0x1a1f60)
 
-Patch #2/#3 (CanGetAchievements Branch-2 / checksum) found at offset: 0x3086230 (RVA 0x3086e30)
+Patch #2/#3 (registered manager eligibility) found at offset: 0x3086230 (RVA 0x3086e30)
 
 Patch #4 (IsGameRuleEnabled predicate) found at offset: 0x4d72f20 (RVA 0x4d73b20)
+
+Patch #5 (Native achievement update gate) found at offset: 0x604ba1f (RVA 0x604c61f)
+
+Patch #6 (Native eligibility boolean gate) found at offset: 0x604becd (RVA 0x604cacd)
+
+Patch #7 (Native eligibility boolean gate) found at offset: 0x9c10e96 (RVA 0x9c11a96)
+
+Patch #8 (Native eligibility boolean gate) found at offset: 0x9c11d43 (RVA 0x9c12943)
 
 EU5 is successfully patched.
 Press Enter to exit...
@@ -90,17 +98,22 @@ Press Enter to exit...
     -> Registration #1 -> callback -> predicate -> Patch #1
     -> Registration #2 -> callback -> predicate -> Patch #2
                                      |
-                                     +-> checksum -> Patch #3
+                                     +-> manager eligibility -> Patch #3
                                          (can be the predicate itself)
 
 "IsGameRuleEnabled"
     -> registration -> callback -> boolean callee -> Patch #4
                        (preserve output marshalling)
 
-B8 01 00 00 00 C3     mov eax, 1; ret
+Native eligibility predicate / update / list initialization / list refresh
+    -> validated allowed branches -> Patches #5-#8
+
+B8 01 00 00 00 C3     mov eax, 1; ret  (#1-#4)
+75 -> EB             take existing true branch (#6-#8)
+0F 84 ... -> NOPs    enter normal update evaluation (#5)
 ```
 
-In the verified build, Branch-2 and checksum share one function and are patched once. Separate checksum callees are still supported. The game-rule wrapper must write its result into an output object, so its boolean callee is patched instead. Every target is resolved before backup; only the six-byte entries are written. Resolution failures leave the executable untouched.
+The GUI registration shares an entry with a copy of the manager eligibility predicate. The shared native predicate and three inlined checks also need coverage. The historical checksum label referred to six eligibility fields. Result marshalling and individual achievement possible/happened triggers still execute normally. Every site is validated before backup and only its replacement bytes are written; incomplete resolution aborts.
 
 ---
 
@@ -112,7 +125,7 @@ python -m unittest discover -s tests -v
 
 # Also check C++ and the real game image, writing only temporary copies
 $env:EU5_CPP_PATCHER = (Resolve-Path .\patch.exe).Path
-$env:EU5_TEST_EXE = 'E:\SteamLibrary\steamapps\common\Europa Universalis V\binaries\eu5.exe'
+$env:EU5_TEST_EXE = 'E:\SteamLibrary\steamapps\common\Europa Universalis V\binaries\eu5.exe.backup'
 python -m unittest discover -s tests -v
 ```
 

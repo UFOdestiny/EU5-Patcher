@@ -2,6 +2,7 @@
 """EU5 Patcher - Enable Achievements Unconditionally"""
 
 import argparse
+from bisect import bisect_right
 import os
 import platform
 import re
@@ -120,7 +121,8 @@ CAN_GET_ACHIEVEMENTS_ANCHOR: Final[bytes] = b"CanGetAchievements\x00"
 IS_GAME_RULE_ENABLED_ANCHOR: Final[bytes] = b"IsGameRuleEnabled\x00"
 RETURN_TRUE: Final[bytes] = b"\xb8\x01\x00\x00\x00\xc3"
 
-# Checksum is either called by Branch-2 or registered directly as its predicate.
+# Historical "checksum" labels below actually identify achievement-manager
+# eligibility state. Its inlined copies must also be patched in newer builds.
 # These field offsets are used only to validate that the resolved callee has the
 # expected checksum-like structure; they are not used as a global signature.
 CHECKSUM_STATE_OFFSETS: Final[frozenset[int]] = frozenset(
@@ -182,6 +184,11 @@ class PatchError(Exception):
 def create_backup(source: Path, dest: Path) -> None:
     """Create a backup of the source file."""
     try:
+        original_dest = dest
+        index = 1
+        while dest.exists():
+            dest = original_dest.with_name(f"{original_dest.name}.{index}")
+            index += 1
         shutil.copy2(source, dest)
         print(f"Backup created: {dest}")
     except OSError as e:
@@ -662,6 +669,102 @@ def add_return_true_job(
     jobs.append(PatchJob(label, offset, tuple(RETURN_TRUE)))
 
 
+def find_native_eligibility_gates(
+    data: bytes, sections: list[PESection], runtime_ranges: list[tuple[int, int]]
+) -> list[PatchJob]:
+    """Find the shared predicate and three inlined gates, including patched forms.
+
+    A full six-field match alone is insufficient. Also require the specific
+    boolean fast path or update-loop branch and an unwind-bounded local body.
+    Patches change only control flow, preserving initialization, Steam calls,
+    per-achievement possible/happened triggers, and GUI output writes.
+    """
+    text = get_section(sections, ".text")
+    ranges = sorted(runtime_ranges)
+    starts = [a for a, _ in ranges]
+    begin = text.raw_offset
+    end = min(len(data), begin + text.raw_size)
+    candidates = []
+    # Debug-mode member comparison shared by all eligibility gate variants.
+    pattern = re.compile(rb"\x80[\xb8-\xbf]\x34\x01\x00\x00\x00")
+    for match in pattern.finditer(data, begin, end):
+        off = match.start()
+        rva = text.rva + off - begin
+        index = bisect_right(starts, rva) - 1
+        if index < 0:
+            continue
+        a, b = ranges[index]
+        if not (a <= rva < b and b - a <= 0x1000):
+            continue
+        score, fields = checksum_structure_score(data, sections, text, ranges, a)
+        if fields != CHECKSUM_STATE_OFFSETS:
+            continue
+        modrm = data[off + 1]
+        if (modrm & 7) == 4:  # SIB would shift the displacement.
+            continue
+        branch = off + 7
+        local_end = rva_to_raw_offset(sections, b - 1) + 1
+        if branch + 18 > local_end:
+            continue
+
+        if data[off - 2:off] in (b"\xb0\x01", b"\xb3\x01"):
+            # mov al/bl,1; cmp debug,0; jne <true merge>; cmp require,1;
+            # jne ...; cmp ironman,0; jne ... . The remaining fields are in
+            # this same validated function. EB is the already-patched form.
+            if data[branch] not in (0x75, 0xEB):
+                continue
+            first = b"\x80" + bytes([modrm]) + struct.pack("<I", 0x139) + b"\x01"
+            second = b"\x80" + bytes([modrm]) + struct.pack("<I", 0x132) + b"\x00"
+            if (data[branch + 2:branch + 9] != first or
+                    data[branch + 9] != 0x75 or
+                    data[branch + 11:branch + 18] != second):
+                continue
+            merge = branch + 2 + struct.unpack_from("<b", data, branch + 1)[0]
+            if not branch + 18 <= merge < local_end:
+                continue
+            candidates.append(PatchJob("Native eligibility boolean gate", branch, (0xEB,)))
+        elif data[branch:branch + 2] == b"\x0f\x84" or data[branch:branch + 6] == b"\x90" * 6:
+            # Update loop: debug mode falls through into normal achievement
+            # evaluation. Bypass the conditional detour into the global gate.
+            require = b"\x80" + bytes([modrm]) + struct.pack("<I", 0x139) + b"\x01"
+            targets = []
+            pos = data.find(require, branch + 6, local_end)
+            while pos >= 0:
+                if (pos + 16 <= local_end and data[pos + 7] == 0x75 and
+                        data[pos + 9:pos + 16] == b"\x80" + bytes([modrm]) + struct.pack("<I", 0x132) + b"\x00"):
+                    targets.append(pos)
+                pos = data.find(require, pos + 1, local_end)
+            if len(targets) != 1:
+                continue
+            if data[branch:branch + 2] == b"\x0f\x84":
+                target = branch + 6 + struct.unpack_from("<i", data, branch + 2)[0]
+                if target != targets[0]:
+                    continue
+            candidates.append(PatchJob("Native achievement update gate", branch, (0x90,) * 6))
+
+    boolean = [j for j in candidates if len(j.replacement) == 1]
+    update = [j for j in candidates if len(j.replacement) == 6]
+    if candidates and (len(boolean) != 3 or len(update) != 1):
+        raise PatchError(
+            f"Incomplete native eligibility gate family: {len(boolean)} boolean, "
+            f"{len(update)} update (expected 3 and 1). No files written."
+        )
+    return sorted(candidates, key=lambda j: j.offset)
+
+
+def add_native_eligibility_jobs(data, sections, runtime_ranges, jobs, *, required):
+    gates = find_native_eligibility_gates(data, sections, runtime_ranges)
+    if required and not gates:
+        raise PatchError("Native achievement eligibility gates were not found; refusing a UI-only patch.")
+    for index, gate in enumerate(gates, 5):
+        replacement = bytes(gate.replacement)
+        label = f"Patch #{index} ({gate.label})"
+        if data[gate.offset:gate.offset + len(replacement)] == replacement:
+            print(f"{label} already patched.")
+        else:
+            jobs.append(PatchJob(label, gate.offset, gate.replacement))
+
+
 def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[PatchJob]:
     """
     Resolve every patch from string anchors/call relationships before writing.
@@ -728,8 +831,8 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
         jobs,
         data,
         sections,
-        ("Patch #2/#3 (CanGetAchievements Branch-2 / checksum)"
-         if branch2_rva == checksum_rva else "Patch #3 (checksum via Branch-2)"),
+        ("Patch #2/#3 (registered manager eligibility)"
+         if branch2_rva == checksum_rva else "Patch #3 (manager eligibility via Branch-2)"),
         checksum_rva,
     )
     add_return_true_job(
@@ -769,6 +872,11 @@ def prepare_patch_jobs(data: bytearray, sections: list[PESection]) -> list[Patch
         callbacks[0],
     )
 
+    # Modern direct registration is only one copy of an inlined manager gate.
+    add_native_eligibility_jobs(
+        data, sections, runtime_ranges, jobs, required=(branch2_rva == checksum_rva)
+    )
+
     return jobs
 
 
@@ -789,7 +897,7 @@ def make_patch(filepath: Path, *, dry_run: bool = False) -> None:
         for job in patch_jobs:
             rva = raw_offset_to_rva(sections, job.offset)
             print(f"{job.label}: offset {job.offset:#x} (RVA {rva:#x})")
-        print(f"Dry run: {len(patch_jobs)} pending function patches; no files written.")
+        print(f"Dry run: {len(patch_jobs)} pending patch sites; no files written.")
         return
 
     if not patch_jobs:

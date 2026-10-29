@@ -76,9 +76,17 @@ Backup created: "E:\\\\SteamLibrary\\steamapps\\common\\Europa Universalis V\\bi
 
 Patch #1 (CanGetAchievements Branch-1) found at offset: 0x1a1360 (RVA 0x1a1f60)
 
-Patch #2/#3 (CanGetAchievements Branch-2 / checksum) found at offset: 0x3086230 (RVA 0x3086e30)
+Patch #2/#3 (registered manager eligibility) found at offset: 0x3086230 (RVA 0x3086e30)
 
 Patch #4 (IsGameRuleEnabled predicate) found at offset: 0x4d72f20 (RVA 0x4d73b20)
+
+Patch #5 (Native achievement update gate) found at offset: 0x604ba1f (RVA 0x604c61f)
+
+Patch #6 (Native eligibility boolean gate) found at offset: 0x604becd (RVA 0x604cacd)
+
+Patch #7 (Native eligibility boolean gate) found at offset: 0x9c10e96 (RVA 0x9c11a96)
+
+Patch #8 (Native eligibility boolean gate) found at offset: 0x9c11d43 (RVA 0x9c12943)
 
 EU5 is successfully patched.
 Press Enter to exit...
@@ -93,17 +101,22 @@ Press Enter to exit...
     -> Registration #1 -> callback -> predicate -> Patch #1
     -> Registration #2 -> callback -> predicate -> Patch #2
                                      |
-                                     +-> checksum -> Patch #3
+                                     +-> manager eligibility -> Patch #3
                                          (can be the predicate itself)
 
 "IsGameRuleEnabled"
     -> registration -> callback -> boolean callee -> Patch #4
                        (preserve output marshalling)
 
-B8 01 00 00 00 C3     mov eax, 1; ret
+Native eligibility predicate / update / list initialization / list refresh
+    -> validated allowed branches -> Patches #5-#8
+
+B8 01 00 00 00 C3     mov eax, 1; ret  (#1-#4)
+75 -> EB             take existing true branch (#6-#8)
+0F 84 ... -> NOPs    enter normal update evaluation (#5)
 ```
 
-新版中 Branch-2 与 checksum 是同一个函数，合并为一次写入；旧的独立调用结构仍受支持。游戏规则的包装回调需要将布尔结果写入输出对象，因此改为补丁其布尔被调函数。先定位并验证全部目标，再备份并仅写入对应入口的 6 字节；定位失败时不写文件。
+新版的 GUI 注册分支与管理器资格函数副本共用入口，合并为一次写入；还需覆盖共享原生函数和 3 处内联检查。原来的“checksum”名称实际指六字段成就资格检查。游戏规则回调的输出封装和具体成就的 `possible`/`happened` 条件仍会正常执行。先验证全部目标，再备份并只写入对应字节；定位不完整时拒绝写入。
 
 ---
 
@@ -115,7 +128,7 @@ python -m unittest discover -s tests -v
 
 # 同时验证 C++ 与真实游戏文件（只操作临时副本）
 $env:EU5_CPP_PATCHER = (Resolve-Path .\patch.exe).Path
-$env:EU5_TEST_EXE = 'E:\SteamLibrary\steamapps\common\Europa Universalis V\binaries\eu5.exe'
+$env:EU5_TEST_EXE = 'E:\SteamLibrary\steamapps\common\Europa Universalis V\binaries\eu5.exe.backup'
 python -m unittest discover -s tests -v
 ```
 

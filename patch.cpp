@@ -5,6 +5,7 @@
  *   CanGetAchievements string -> registration xref -> callback -> predicate
  *   Branch-2 -> checksum callee, or the checksum predicate itself
  *   IsGameRuleEnabled string -> registration -> callback -> boolean callee
+ *   Native manager predicate + inlined update/list gates -> force allowed path
  *
  * Patch #1/#2/#3/#4 all replace the target function entry with:
  *   mov eax, 1
@@ -123,6 +124,7 @@ namespace
         std::string label;
         size_t offset{};
         uint32_t rva{};
+        std::vector<uint8_t> replacement{RETURN_TRUE.begin(), RETURN_TRUE.end()};
     };
 
     struct RegisteredCallback
@@ -206,7 +208,7 @@ namespace
         {
             file.seekp(static_cast<std::streamoff>(job.offset));
             file.write(reinterpret_cast<const char *>(data.data() + job.offset),
-                       static_cast<std::streamsize>(RETURN_TRUE.size()));
+                       static_cast<std::streamsize>(job.replacement.size()));
             if (!file)
                 return false;
         }
@@ -218,7 +220,7 @@ namespace
     [[nodiscard]] bool create_backup(const fs::path &source, const fs::path &dest)
     {
         std::error_code ec;
-        fs::copy_file(source, dest, fs::copy_options::overwrite_existing, ec);
+        fs::copy_file(source, dest, fs::copy_options::none, ec);
         return !ec;
     }
 
@@ -1071,6 +1073,109 @@ namespace
         jobs.push_back({std::move(label), offset, target_rva});
     }
 
+    [[nodiscard]] std::vector<PatchJob> find_native_eligibility_gates(
+        const std::vector<uint8_t> &data,
+        const std::vector<PESection> &sections,
+        const std::vector<RuntimeFunctionRange> &runtime_ranges)
+    {
+        const auto &text = get_section(sections, ".text");
+        auto ranges = runtime_ranges;
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b)
+                  { return a.begin < b.begin; });
+        const size_t end = std::min<uint64_t>(data.size(),
+            static_cast<uint64_t>(text.raw_offset) + text.raw_size);
+        std::vector<PatchJob> candidates;
+        for (size_t off = text.raw_offset; off + 7 <= end; ++off)
+        {
+            // CMP byte ptr [base+0x134],0, no SIB. Match a full, local family
+            // rather than treating every state-field access as a patch site.
+            if (data[off] != 0x80 || (data[off + 1] & 0xF8) != 0xB8 ||
+                (data[off + 1] & 7) == 4 || read_u32(data, off + 2) != 0x134 ||
+                data[off + 6] != 0)
+                continue;
+            const uint32_t rva = text.rva + static_cast<uint32_t>(off - text.raw_offset);
+            auto it = std::upper_bound(ranges.begin(), ranges.end(), rva,
+                [](uint32_t value, const RuntimeFunctionRange &r) { return value < r.begin; });
+            if (it == ranges.begin())
+                continue;
+            const auto &range = *--it;
+            if (rva >= range.end || range.end - range.begin > 0x1000 || off < 2)
+                continue;
+            const auto score = checksum_structure_score(data, sections, text, ranges, range.begin);
+            if (score.fields.size() != CHECKSUM_STATE_OFFSETS.size())
+                continue;
+            const size_t branch = off + 7;
+            const size_t local_end = rva_to_raw_offset(sections, range.end - 1) + 1;
+            if (branch + 18 > local_end || local_end > data.size())
+                continue;
+            const uint8_t modrm = data[off + 1];
+            const auto cmp_field = [&](size_t pos, uint32_t field, uint8_t value)
+            {
+                return pos + 7 <= local_end && data[pos] == 0x80 &&
+                    data[pos + 1] == modrm && read_u32(data, pos + 2) == field &&
+                    data[pos + 6] == value;
+            };
+            if ((data[off - 2] == 0xB0 || data[off - 2] == 0xB3) && data[off - 1] == 1)
+            {
+                if ((data[branch] != 0x75 && data[branch] != 0xEB) ||
+                    !cmp_field(branch + 2, 0x139, 1) || data[branch + 9] != 0x75 ||
+                    !cmp_field(branch + 11, 0x132, 0))
+                    continue;
+                const int64_t merge = static_cast<int64_t>(branch) + 2 +
+                                      static_cast<int8_t>(data[branch + 1]);
+                if (merge < static_cast<int64_t>(branch + 18) ||
+                    merge >= static_cast<int64_t>(local_end))
+                    continue;
+                candidates.push_back({"Native eligibility boolean gate", branch, rva + 7, {0xEB}});
+            }
+            else
+            {
+                const bool original = data[branch] == 0x0F && data[branch + 1] == 0x84;
+                const bool patched = std::all_of(data.begin() + branch, data.begin() + branch + 6,
+                                                [](uint8_t b) { return b == 0x90; });
+                if (!original && !patched)
+                    continue;
+                std::vector<size_t> targets;
+                for (size_t pos = branch + 6; pos + 16 <= local_end; ++pos)
+                    if (cmp_field(pos, 0x139, 1) && data[pos + 7] == 0x75 &&
+                        cmp_field(pos + 9, 0x132, 0))
+                        targets.push_back(pos);
+                if (targets.size() != 1)
+                    continue;
+                if (original && static_cast<int64_t>(branch) + 6 + read_i32(data, branch + 2) !=
+                                    static_cast<int64_t>(targets.front()))
+                    continue;
+                candidates.push_back({"Native achievement update gate", branch, rva + 7,
+                                      std::vector<uint8_t>(6, 0x90)});
+            }
+        }
+        const auto boolean_count = std::count_if(candidates.begin(), candidates.end(),
+            [](const PatchJob &job) { return job.replacement.size() == 1; });
+        if (!candidates.empty() && (boolean_count != 3 || candidates.size() != 4))
+            throw PatchError("Incomplete native eligibility gate family (expected 3 boolean and 1 update). No files written.");
+        return candidates;
+    }
+
+    void add_native_eligibility_jobs(
+        const std::vector<uint8_t> &data,
+        const std::vector<PESection> &sections,
+        const std::vector<RuntimeFunctionRange> &runtime_ranges,
+        std::vector<PatchJob> &jobs, bool required)
+    {
+        auto gates = find_native_eligibility_gates(data, sections, runtime_ranges);
+        if (required && gates.empty())
+            throw PatchError("Native achievement eligibility gates were not found; refusing a UI-only patch.");
+        size_t index = 5;
+        for (auto &gate : gates)
+        {
+            gate.label = "Patch #" + std::to_string(index++) + " (" + gate.label + ")";
+            if (std::equal(gate.replacement.begin(), gate.replacement.end(), data.begin() + gate.offset))
+                std::cout << gate.label << " already patched.\n";
+            else
+                jobs.push_back(std::move(gate));
+        }
+    }
+
     [[nodiscard]] std::vector<PatchJob> prepare_patch_jobs(
         const std::vector<uint8_t> &data,
         const std::vector<PESection> &sections)
@@ -1143,8 +1248,8 @@ namespace
                             "Patch #1 (CanGetAchievements Branch-1)", branch1_rva);
         add_return_true_job(jobs, data, sections,
                             branch2_rva == checksum_rva
-                                ? "Patch #2/#3 (CanGetAchievements Branch-2 / checksum)"
-                                : "Patch #3 (checksum via Branch-2)", checksum_rva);
+                                ? "Patch #2/#3 (registered manager eligibility)"
+                                : "Patch #3 (manager eligibility via Branch-2)", checksum_rva);
         add_return_true_job(jobs, data, sections,
                             "Patch #2 (CanGetAchievements Branch-2)", branch2_rva);
 
@@ -1188,6 +1293,9 @@ namespace
                             "Patch #4 (IsGameRuleEnabled predicate)",
                             callbacks.front());
 
+        add_native_eligibility_jobs(data, sections, runtime_ranges, jobs,
+                                    branch2_rva == checksum_rva);
+
         return jobs;
     }
 
@@ -1201,11 +1309,11 @@ namespace
         if (debug_info)
             std::cout << "Applying " << job.label << "...\n\n";
 
-        for (size_t i = 0; i < RETURN_TRUE.size(); ++i)
+        for (size_t i = 0; i < job.replacement.size(); ++i)
         {
             const size_t absolute_pos = job.offset + i;
             const uint8_t original = data[absolute_pos];
-            const uint8_t replacement = RETURN_TRUE[i];
+            const uint8_t replacement = job.replacement[i];
 
             if (debug_info)
             {
@@ -1245,7 +1353,7 @@ namespace
                     std::cout << job.label << ": offset 0x" << std::hex << job.offset
                               << " (RVA 0x" << job.rva << ")\n" << std::dec;
                 std::cout << "Dry run: " << patch_jobs.size()
-                          << " pending function patches; no files written.\n";
+                          << " pending patch sites; no files written.\n";
                 return 0;
             }
 
@@ -1258,6 +1366,13 @@ namespace
 
             auto backup_path = filepath;
             backup_path += EU5_BACKUP_SUFFIX;
+            const auto original_backup = backup_path;
+            size_t backup_index = 1;
+            while (fs::exists(backup_path))
+            {
+                backup_path = original_backup;
+                backup_path += "." + std::to_string(backup_index++);
+            }
             if (!create_backup(filepath, backup_path))
             {
                 std::cerr << "Error: Failed to create backup.\n";
